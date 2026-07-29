@@ -7,25 +7,19 @@ Deno.serve(async (req) => {
   }
 
   try {
-    // 1. On garde l'URL telle quelle.
-    //    (hl=fr est un paramètre Google, inutile/nuisible pour Airbnb.)
-    //    Si tu veux forcer la langue Google, décommente les 2 lignes ci-dessous
-    //    uniquement quand l'hôte est google.*
+    // 1. On prépare l'URL pour forcer le français (hl=fr)
     const urlObj = new URL(targetUrl);
-    if (urlObj.hostname.includes("google.")) {
-      urlObj.searchParams.set("hl", "fr");
-    }
+    urlObj.searchParams.set("hl", "fr");
 
-    // 2. Fetch avec un User-Agent de bot d'aperçu social.
-    //    Les sites (Airbnb, etc.) laissent souvent passer ces bots pour
-    //    qu'ils récupèrent les balises og:, là où un UA "navigateur" depuis
-    //    une IP datacenter se fait bloquer.
+    // 2. Fetch avec Headers pour simuler Safari iPhone
     const res = await fetch(urlObj.toString(), {
       headers: {
+        // User-agent Safari iPhone
         "user-agent":
-          "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "accept":
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
+          "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
+          "Version/17.0 Mobile/15E148 Safari/604.1",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "fr-FR,fr;q=0.9",
         // Cookie de consentement pour éviter les écrans RGPD Google
         "cookie": "CONSENT=YES+cb.20240117-07-p0.fr+FX+901;",
@@ -34,19 +28,7 @@ Deno.serve(async (req) => {
     });
 
     const html = await res.text();
-
-    // ---- DIAGNOSTIC : à regarder dans les logs Deno Deploy ----
-    console.log("target:", urlObj.toString());
-    console.log("status:", res.status);
-    console.log("content-type:", res.headers.get("content-type"));
-    console.log("html length:", html.length);
-    console.log("snippet:", html.slice(0, 500));
-    // ------------------------------------------------------------
-
     const metadata = parseHtml(html, targetUrl);
-
-    // On expose le statut HTTP dans la réponse pour debug côté client
-    metadata._status = res.status;
 
     return json(metadata);
   } catch (err) {
@@ -73,14 +55,13 @@ function parseHtml(html: string, originalUrl: string) {
 
   // 2. Extraction de tous les meta tags
   const metaTagRegex = /<meta\s+([^>]+)>/gi;
+  const attrRegex = /([a-zA-Z0-9:_-]+)\s*=\s*["']([^"']*)["']/gi;
 
-  let tagMatch: RegExpExecArray | null;
+  let tagMatch;
   while ((tagMatch = metaTagRegex.exec(html))) {
     const attrs: Record<string, string> = {};
+    let attrMatch;
 
-    // Important : recréer le regex à chaque tag pour repartir de lastIndex = 0
-    const attrRegex = /([a-zA-Z0-9:_-]+)\s*=\s*["']([^"']*)["']/gi;
-    let attrMatch: RegExpExecArray | null;
     while ((attrMatch = attrRegex.exec(tagMatch[1]))) {
       attrs[attrMatch[1].toLowerCase()] = attrMatch[2];
     }
