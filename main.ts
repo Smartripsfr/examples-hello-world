@@ -163,39 +163,37 @@ function looksChallenged(html: string): boolean {
   return /challenges\.cloudflare\.com|cf-browser-verification|__cf_chl|_cf_chl_opt|turnstile|cf-mitigated/i.test(html);
 }
 
-// En usage normal (hors &test=1), on n'utilise QUE l'UA Iframely — pas de
-// boucle de fallback sur les autres UA de la liste.
-const IFRAMELY_UA = UA_LIST.find((u) => u.name === "Iframely")!.ua;
-
 async function fetchWithFallback(url: string): Promise<FetchOk | FetchFail> {
+  let last: FetchFail["last"] = null;
+  let sawChallenge = false;
   const requestUrl = buildRequestUrl(url);
-  const ua = IFRAMELY_UA;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(requestUrl, {
-      headers: { ...BASE_HEADERS, "user-agent": ua },
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    const html = await res.text();
-    const challenge = looksChallenged(html);
-    const last: FetchFail["last"] = { status: res.status, snippet: html.slice(0, 300), userAgent: ua, challenge };
+  for (const { ua } of UA_LIST) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(requestUrl, {
+        headers: { ...BASE_HEADERS, "user-agent": ua },
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      const html = await res.text();
+      const challenge = looksChallenged(html);
+      if (challenge) sawChallenge = true;
+      last = { status: res.status, snippet: html.slice(0, 300), userAgent: ua, challenge };
 
-    if (res.ok && !challenge && /<meta\b/i.test(html)) {
-      return { ok: true, html, userAgent: ua, status: res.status, finalUrl: res.url };
+      if (res.ok && !challenge && /<meta\b/i.test(html)) {
+        return { ok: true, html, userAgent: ua, status: res.status, finalUrl: res.url };
+      }
+    } catch (err) {
+      last = { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: ua, challenge: false };
+    } finally {
+      clearTimeout(timer);
     }
-    return { ok: false, reason: challenge ? "challenge" : "http", last };
-  } catch (err) {
-    return {
-      ok: false,
-      reason: "none",
-      last: { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: ua, challenge: false },
-    };
-  } finally {
-    clearTimeout(timer);
+    if (SCRAPE_API) break;
   }
+
+  return { ok: false, reason: sawChallenge ? "challenge" : (last ? "http" : "none"), last };
 }
 
 /* -------------------- Parsing -------------------- */
