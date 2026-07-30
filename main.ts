@@ -1,21 +1,54 @@
 // meta-scraper.ts
-// Récupère le <title> et les meta tags (OG, Twitter, itemprop, etc.) d'une page.
-// Essaie plusieurs user-agents dans l'ordre et garde le premier qui renvoie
-// une page exploitable (statut 2xx + présence de balises <meta>).
+// Récupère le <title> et les meta tags (OG, Twitter, itemprop, JSON-LD) d'une page.
 //
-// Lancer :  deno run --allow-net meta-scraper.ts
+// Lancer :  deno run --allow-net --allow-env meta-scraper.ts
 // Appeler : http://localhost:8000/?url=https://exemple.com/page
+//
+// Contournement anti-bot (recommandé pour les sites protégés type GetYourGuide) :
+//   Poser une variable d'env SCRAPE_API pointant vers un service de scraping,
+//   avec {url} comme placeholder pour l'URL cible (encodée automatiquement) :
+//     ScraperAPI  : SCRAPE_API="http://api.scraperapi.com?api_key=XXX&url={url}"
+//     ScrapingBee : SCRAPE_API="https://app.scrapingbee.com/api/v1/?api_key=XXX&url={url}"
+//   Sans SCRAPE_API, le fetch va directement sur la cible (souvent 403 si anti-bot).
 
-const USER_AGENTS = [
-  // Crawler social : le plus souvent whitelisté pour servir les OG tags
-  "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-  "Twitterbot/1.0",
-  // Navigateur desktop réaliste en dernier recours
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+const SCRAPE_API = Deno.env.get("SCRAPE_API");
+const TIMEOUT_MS = 15_000;
+
+// En-têtes de base envoyés dans tous les cas.
+const BASE_HEADERS: Record<string, string> = {
+  "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
+};
+
+// Profils user-agent essayés dans l'ordre. Le profil navigateur ajoute les
+// en-têtes "client hints" / "sec-fetch" cohérents avec un vrai Chrome.
+type Agent = { ua: string; headers: Record<string, string> };
+
+const AGENTS: Agent[] = [
+  {
+    ua: "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+    headers: {},
+  },
+  {
+    ua: "Twitterbot/1.0",
+    headers: {},
+  },
+  {
+    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    headers: {
+      "sec-ch-ua":
+        '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="24"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "none",
+      "sec-fetch-user": "?1",
+      "upgrade-insecure-requests": "1",
+    },
+  },
 ];
-
-const TIMEOUT_MS = 10_000;
 
 Deno.serve(async (req) => {
   const { searchParams } = new URL(req.url);
@@ -25,7 +58,6 @@ Deno.serve(async (req) => {
     return json({ error: "Le paramètre 'url' est manquant" }, 400);
   }
 
-  // Validation de l'URL fournie
   let parsedTarget: URL;
   try {
     parsedTarget = new URL(targetUrl);
@@ -40,11 +72,12 @@ Deno.serve(async (req) => {
     const result = await fetchWithFallback(parsedTarget.toString());
 
     if (!result.ok) {
-      // Aucun UA n'a donné une page exploitable : on renvoie le dernier
-      // essai pour diagnostiquer (403 Cloudflare, challenge JS, etc.)
       return json(
         {
           error: "Aucun user-agent n'a permis de récupérer une page exploitable",
+          hint: SCRAPE_API
+            ? "Le service SCRAPE_API a aussi échoué : vérifie ta clé/quota."
+            : "403 = anti-bot. Définis une variable d'env SCRAPE_API (voir en-tête du fichier).",
           url: targetUrl,
           lastAttempt: result.last,
         },
@@ -55,6 +88,7 @@ Deno.serve(async (req) => {
     const metadata = parseHtml(result.html, targetUrl);
     metadata.jsonLd = extractJsonLd(result.html);
     metadata._debug = {
+      via: SCRAPE_API ? "scrape_api" : "direct",
       userAgentUsed: result.userAgent,
       httpStatus: result.status,
       finalUrl: result.finalUrl,
@@ -82,42 +116,44 @@ type FetchFail = {
   last: { status: number; snippet: string; userAgent: string } | null;
 };
 
+// Construit l'URL réellement appelée : soit la cible directe, soit via SCRAPE_API.
+function buildRequestUrl(target: string): string {
+  if (SCRAPE_API) return SCRAPE_API.replace("{url}", encodeURIComponent(target));
+  return target;
+}
+
 async function fetchWithFallback(url: string): Promise<FetchOk | FetchFail> {
   let last: FetchFail["last"] = null;
+  const requestUrl = buildRequestUrl(url);
 
-  for (const ua of USER_AGENTS) {
+  for (const agent of AGENTS) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const res = await fetch(url, {
+      const res = await fetch(requestUrl, {
         headers: {
-          "user-agent": ua,
-          "accept":
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "accept-language": "fr-FR,fr;q=0.9",
+          ...BASE_HEADERS,
+          ...agent.headers,
+          "user-agent": agent.ua,
         },
         redirect: "follow",
         signal: controller.signal,
       });
 
       const html = await res.text();
-      last = { status: res.status, snippet: html.slice(0, 300), userAgent: ua };
+      last = { status: res.status, snippet: html.slice(0, 300), userAgent: agent.ua };
 
-      // On garde la réponse si le statut est OK et qu'on voit des balises meta
       if (res.ok && /<meta\b/i.test(html)) {
-        return {
-          ok: true,
-          html,
-          userAgent: ua,
-          status: res.status,
-          finalUrl: res.url,
-        };
+        return { ok: true, html, userAgent: agent.ua, status: res.status, finalUrl: res.url };
       }
     } catch (err) {
-      last = { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: ua };
+      last = { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: agent.ua };
     } finally {
       clearTimeout(timer);
     }
+
+    // Via un service de scraping, inutile de tester d'autres UA : il gère lui-même.
+    if (SCRAPE_API) break;
   }
 
   return { ok: false, last };
@@ -129,25 +165,20 @@ function parseHtml(html: string, originalUrl: string) {
   const metadata: Record<string, unknown> = { url: originalUrl, title: "" };
 
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (titleMatch) {
-    metadata.title = decodeEntities(titleMatch[1].trim());
-  }
+  if (titleMatch) metadata.title = decodeEntities(titleMatch[1].trim());
 
   const metaTagRegex = /<meta\b([^>]*)>/gi;
   let tagMatch: RegExpExecArray | null;
   while ((tagMatch = metaTagRegex.exec(html))) {
     const attrs = parseAttributes(tagMatch[1]);
-    const key =
-      attrs.name || attrs.property || attrs.itemprop || attrs["http-equiv"];
+    const key = attrs.name || attrs.property || attrs.itemprop || attrs["http-equiv"];
     const content = attrs.content;
 
     if (key && content !== undefined) {
       const value = decodeEntities(content);
       const existing = metadata[key];
       if (existing !== undefined) {
-        metadata[key] = Array.isArray(existing)
-          ? [...existing, value]
-          : [existing, value];
+        metadata[key] = Array.isArray(existing) ? [...existing, value] : [existing, value];
       } else {
         metadata[key] = value;
       }
@@ -159,11 +190,9 @@ function parseHtml(html: string, originalUrl: string) {
   return metadata;
 }
 
-// Gère les valeurs entre guillemets doubles, simples, ou sans guillemets.
 function parseAttributes(raw: string): Record<string, string> {
   const attrs: Record<string, string> = {};
-  const attrRegex =
-    /([a-zA-Z0-9:_-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+  const attrRegex = /([a-zA-Z0-9:_-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
   let m: RegExpExecArray | null;
   while ((m = attrRegex.exec(raw))) {
     if (!m[1]) continue;
@@ -172,11 +201,9 @@ function parseAttributes(raw: string): Record<string, string> {
   return attrs;
 }
 
-// Extraction bonus des blocs JSON-LD (prix, note, avis sur GetYourGuide).
 function extractJsonLd(html: string): unknown[] {
   const blocks: unknown[] = [];
-  const re =
-    /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html))) {
     try {
