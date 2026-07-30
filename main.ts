@@ -11,14 +11,11 @@ Deno.serve(async (req) => {
     const urlObj = new URL(targetUrl);
     urlObj.searchParams.set("hl", "fr");
 
-    // 2. Fetch avec Headers pour simuler Safari iPhone
+    // 2. Fetch avec Headers pour simuler le bot Twitter (X)
     const res = await fetch(urlObj.toString(), {
       headers: {
-        // User-agent Safari iPhone
-        "user-agent":
-          "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
-          "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
-          "Version/17.0 Mobile/15E148 Safari/604.1",
+        // User-agent de Twitter : souvent accepté pour servir les meta tags
+        "user-agent": "Twitterbot/1.0",
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "fr-FR,fr;q=0.9",
         // Cookie de consentement pour éviter les écrans RGPD Google
