@@ -20,9 +20,12 @@ const BASE_HEADERS: Record<string, string> = {
   "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
 };
 
-// UA de crawlers/bots à tester. Ceux souvent whitelistés par chaîne UA sont
-// en haut. La liste sert au mode test ET de fallback en usage normal.
+// UA de crawlers/bots à tester. Iframely est placé en premier : c'est l'UA
+// utilisé en priorité en usage normal (fetchWithFallback l'essaie d'abord).
+// Les autres servent de fallback si Iframely est bloqué, et la liste sert
+// aussi au mode test.
 const UA_LIST: { name: string; ua: string }[] = [
+  { name: "Iframely", ua: "Iframely/1.3.1 (+https://iframely.com/docs/about)" },
   { name: "Googlebot", ua: "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
   { name: "Googlebot-Mobile", ua: "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
   { name: "Google-InspectionTool", ua: "Mozilla/5.0 (compatible; Google-InspectionTool/1.0)" },
@@ -40,7 +43,6 @@ const UA_LIST: { name: string; ua: string }[] = [
   { name: "redditbot", ua: "Mozilla/5.0 (compatible; redditbot/1.0; +http://www.reddit.com/feedback)" },
   { name: "DuckDuckBot", ua: "DuckDuckBot/1.1; (+http://duckduckgo.com/duckduckbot.html)" },
   { name: "Yahoo-Slurp", ua: "Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)" },
-  { name: "Iframely", ua: "Iframely/1.3.1 (+https://iframely.com/docs/about)" },
   { name: "Embedly", ua: "Mozilla/5.0 (compatible; Embedly/0.2; +http://support.embed.ly/)" },
   { name: "Chrome-desktop", ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" },
 ];
