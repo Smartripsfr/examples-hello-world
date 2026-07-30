@@ -4,24 +4,26 @@
 // Lancer :  deno run --allow-net --allow-env meta-scraper.ts
 // Appeler : http://localhost:8000/?url=https://exemple.com/page
 //
-// Contournement anti-bot (recommandé pour les sites protégés type GetYourGuide) :
-//   Poser une variable d'env SCRAPE_API pointant vers un service de scraping,
-//   avec {url} comme placeholder pour l'URL cible (encodée automatiquement) :
-//     ScraperAPI  : SCRAPE_API="http://api.scraperapi.com?api_key=XXX&url={url}"
-//     ScrapingBee : SCRAPE_API="https://app.scrapingbee.com/api/v1/?api_key=XXX&url={url}"
-//   Sans SCRAPE_API, le fetch va directement sur la cible (souvent 403 si anti-bot).
+// ATTENTION anti-bot : les sites protégés par un challenge JS (Cloudflare
+// "Just a moment...", DataDome...) ne peuvent PAS être franchis par un simple
+// fetch, qui n'exécute pas de JavaScript. Il faut passer par un service qui
+// résout le challenge, via la variable d'env SCRAPE_API ({url} = placeholder) :
+//
+//   ScrapingBee : SCRAPE_API="https://app.scrapingbee.com/api/v1/?api_key=XXX&render_js=true&stealth_proxy=true&url={url}"
+//   ScraperAPI  : SCRAPE_API="http://api.scraperapi.com?api_key=XXX&render=true&ultra_premium=true&url={url}"
+//   FlareSolverr (self-hosted) : à appeler différemment (POST), voir leur doc.
+//
+// Les paramètres render_js / render ET stealth_proxy / ultra_premium sont
+// indispensables pour Cloudflare : sans eux, tu récupères la page de challenge.
 
 const SCRAPE_API = Deno.env.get("SCRAPE_API");
-const TIMEOUT_MS = 15_000;
+const TIMEOUT_MS = 30_000; // le rendu JV d'un service anti-bot peut être lent
 
-// En-têtes de base envoyés dans tous les cas.
 const BASE_HEADERS: Record<string, string> = {
   "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
 };
 
-// Profils user-agent essayés dans l'ordre. Le profil navigateur ajoute les
-// en-têtes "client hints" / "sec-fetch" cohérents avec un vrai Chrome.
 type Agent = { ua: string; headers: Record<string, string> };
 
 const AGENTS: Agent[] = [
@@ -54,16 +56,12 @@ Deno.serve(async (req) => {
   const { searchParams } = new URL(req.url);
   const targetUrl = searchParams.get("url");
 
-  if (!targetUrl) {
-    return json({ error: "Le paramètre 'url' est manquant" }, 400);
-  }
+  if (!targetUrl) return json({ error: "Le paramètre 'url' est manquant" }, 400);
 
   let parsedTarget: URL;
   try {
     parsedTarget = new URL(targetUrl);
-    if (!/^https?:$/.test(parsedTarget.protocol)) {
-      throw new Error("protocole non supporté");
-    }
+    if (!/^https?:$/.test(parsedTarget.protocol)) throw new Error("protocole non supporté");
   } catch {
     return json({ error: "URL invalide", value: targetUrl }, 400);
   }
@@ -74,10 +72,16 @@ Deno.serve(async (req) => {
     if (!result.ok) {
       return json(
         {
-          error: "Aucun user-agent n'a permis de récupérer une page exploitable",
-          hint: SCRAPE_API
-            ? "Le service SCRAPE_API a aussi échoué : vérifie ta clé/quota."
-            : "403 = anti-bot. Définis une variable d'env SCRAPE_API (voir en-tête du fichier).",
+          error: result.reason === "challenge"
+            ? "Bloqué par un challenge JavaScript (Cloudflare/anti-bot) — impossible sans rendu JS"
+            : "Aucun user-agent n'a permis de récupérer une page exploitable",
+          hint: result.reason === "challenge"
+            ? (SCRAPE_API
+                ? "Active le rendu JS sur ton service : render_js=true + stealth_proxy (ScrapingBee) ou render=true + ultra_premium=true (ScraperAPI)."
+                : "fetch n'exécute pas de JS. Passe par SCRAPE_API avec rendu JS, un proxy résidentiel, ou FlareSolverr.")
+            : (SCRAPE_API
+                ? "Le service SCRAPE_API a échoué : vérifie clé/quota/paramètres."
+                : "403 = anti-bot. Définis SCRAPE_API (voir en-tête du fichier)."),
           url: targetUrl,
           lastAttempt: result.last,
         },
@@ -95,10 +99,7 @@ Deno.serve(async (req) => {
     };
     return json(metadata);
   } catch (err) {
-    return json(
-      { error: "Impossible de récupérer l'URL", details: (err as Error).message },
-      500,
-    );
+    return json({ error: "Impossible de récupérer l'URL", details: (err as Error).message }, 500);
   }
 });
 
@@ -113,17 +114,26 @@ type FetchOk = {
 };
 type FetchFail = {
   ok: false;
-  last: { status: number; snippet: string; userAgent: string } | null;
+  reason: "challenge" | "http" | "none";
+  last: { status: number; snippet: string; userAgent: string; challenge: boolean } | null;
 };
 
-// Construit l'URL réellement appelée : soit la cible directe, soit via SCRAPE_API.
 function buildRequestUrl(target: string): string {
   if (SCRAPE_API) return SCRAPE_API.replace("{url}", encodeURIComponent(target));
   return target;
 }
 
+// Détecte les pages-piège anti-bot (challenge JS) plutôt que le vrai contenu.
+function looksChallenged(html: string): boolean {
+  const title = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "").toLowerCase();
+  if (title.includes("just a moment") || title.includes("attention required")) return true;
+  return /challenges\.cloudflare\.com|cf-browser-verification|__cf_chl|_cf_chl_opt|turnstile|cf-mitigated/i
+    .test(html);
+}
+
 async function fetchWithFallback(url: string): Promise<FetchOk | FetchFail> {
   let last: FetchFail["last"] = null;
+  let sawChallenge = false;
   const requestUrl = buildRequestUrl(url);
 
   for (const agent of AGENTS) {
@@ -131,32 +141,30 @@ async function fetchWithFallback(url: string): Promise<FetchOk | FetchFail> {
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
       const res = await fetch(requestUrl, {
-        headers: {
-          ...BASE_HEADERS,
-          ...agent.headers,
-          "user-agent": agent.ua,
-        },
+        headers: { ...BASE_HEADERS, ...agent.headers, "user-agent": agent.ua },
         redirect: "follow",
         signal: controller.signal,
       });
 
       const html = await res.text();
-      last = { status: res.status, snippet: html.slice(0, 300), userAgent: agent.ua };
+      const challenge = looksChallenged(html);
+      if (challenge) sawChallenge = true;
+      last = { status: res.status, snippet: html.slice(0, 300), userAgent: agent.ua, challenge };
 
-      if (res.ok && /<meta\b/i.test(html)) {
+      // Succès seulement si : statut OK, pas de challenge, et des <meta> présents.
+      if (res.ok && !challenge && /<meta\b/i.test(html)) {
         return { ok: true, html, userAgent: agent.ua, status: res.status, finalUrl: res.url };
       }
     } catch (err) {
-      last = { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: agent.ua };
+      last = { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: agent.ua, challenge: false };
     } finally {
       clearTimeout(timer);
     }
 
-    // Via un service de scraping, inutile de tester d'autres UA : il gère lui-même.
-    if (SCRAPE_API) break;
+    if (SCRAPE_API) break; // le service gère lui-même la rotation
   }
 
-  return { ok: false, last };
+  return { ok: false, reason: sawChallenge ? "challenge" : (last ? "http" : "none"), last };
 }
 
 /* -------------------- Parsing -------------------- */
