@@ -2,59 +2,53 @@
 // Récupère le <title> et les meta tags (OG, Twitter, itemprop, JSON-LD) d'une page.
 //
 // Lancer :  deno run --allow-net --allow-env meta-scraper.ts
-// Appeler : http://localhost:8000/?url=https://exemple.com/page
 //
-// ATTENTION anti-bot : les sites protégés par un challenge JS (Cloudflare
-// "Just a moment...", DataDome...) ne peuvent PAS être franchis par un simple
-// fetch, qui n'exécute pas de JavaScript. Il faut passer par un service qui
-// résout le challenge, via la variable d'env SCRAPE_API ({url} = placeholder) :
+// USAGE NORMAL :
+//   http://localhost:8000/?url=https://exemple.com/page
 //
-//   ScrapingBee : SCRAPE_API="https://app.scrapingbee.com/api/v1/?api_key=XXX&render_js=true&stealth_proxy=true&url={url}"
-//   ScraperAPI  : SCRAPE_API="http://api.scraperapi.com?api_key=XXX&render=true&ultra_premium=true&url={url}"
-//   FlareSolverr (self-hosted) : à appeler différemment (POST), voir leur doc.
-//
-// Les paramètres render_js / render ET stealth_proxy / ultra_premium sont
-// indispensables pour Cloudflare : sans eux, tu récupères la page de challenge.
+// MODE TEST (balaie une liste d'UA et dit lesquels passent) :
+//   http://localhost:8000/?url=https://exemple.com/page&test=1
+//   -> à lancer depuis ta machine locale (IP résidentielle) : si l'autorisation
+//      anti-bot est vérifiée par IP, un serveur/datacenter sera bloqué quel que
+//      soit l'UA.
 
-const SCRAPE_API = Deno.env.get("SCRAPE_API");
-const TIMEOUT_MS = 30_000; // le rendu JV d'un service anti-bot peut être lent
+const SCRAPE_API = Deno.env.get("SCRAPE_API"); // ignoré en mode test
+const TIMEOUT_MS = 15_000;
 
 const BASE_HEADERS: Record<string, string> = {
   "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
 };
 
-type Agent = { ua: string; headers: Record<string, string> };
-
-const AGENTS: Agent[] = [
-  {
-    ua: "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-    headers: {},
-  },
-  {
-    ua: "Twitterbot/1.0",
-    headers: {},
-  },
-  {
-    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    headers: {
-      "sec-ch-ua":
-        '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="24"',
-      "sec-ch-ua-mobile": "?0",
-      "sec-ch-ua-platform": '"Windows"',
-      "sec-fetch-dest": "document",
-      "sec-fetch-mode": "navigate",
-      "sec-fetch-site": "none",
-      "sec-fetch-user": "?1",
-      "upgrade-insecure-requests": "1",
-    },
-  },
+// UA de crawlers/bots à tester. Ceux souvent whitelistés par chaîne UA sont
+// en haut. La liste sert au mode test ET de fallback en usage normal.
+const UA_LIST: { name: string; ua: string }[] = [
+  { name: "Googlebot", ua: "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
+  { name: "Googlebot-Mobile", ua: "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
+  { name: "Google-InspectionTool", ua: "Mozilla/5.0 (compatible; Google-InspectionTool/1.0)" },
+  { name: "Bingbot", ua: "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)" },
+  { name: "facebookexternalhit", ua: "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)" },
+  { name: "facebookcatalog", ua: "facebookcatalog/1.0" },
+  { name: "Twitterbot", ua: "Twitterbot/1.0" },
+  { name: "LinkedInBot", ua: "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)" },
+  { name: "Slackbot", ua: "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)" },
+  { name: "Discordbot", ua: "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)" },
+  { name: "WhatsApp", ua: "WhatsApp/2.23.20.0" },
+  { name: "TelegramBot", ua: "TelegramBot (like TwitterBot)" },
+  { name: "Applebot", ua: "Mozilla/5.0 (compatible; Applebot/0.1; +http://www.apple.com/go/applebot)" },
+  { name: "Pinterestbot", ua: "Mozilla/5.0 (compatible; Pinterestbot/1.0; +https://www.pinterest.com/bot.html)" },
+  { name: "redditbot", ua: "Mozilla/5.0 (compatible; redditbot/1.0; +http://www.reddit.com/feedback)" },
+  { name: "DuckDuckBot", ua: "DuckDuckBot/1.1; (+http://duckduckgo.com/duckduckbot.html)" },
+  { name: "Yahoo-Slurp", ua: "Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)" },
+  { name: "Iframely", ua: "Iframely/1.3.1 (+https://iframely.com/docs/about)" },
+  { name: "Embedly", ua: "Mozilla/5.0 (compatible; Embedly/0.2; +http://support.embed.ly/)" },
+  { name: "Chrome-desktop", ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" },
 ];
 
 Deno.serve(async (req) => {
   const { searchParams } = new URL(req.url);
   const targetUrl = searchParams.get("url");
+  const isTest = searchParams.has("test");
 
   if (!targetUrl) return json({ error: "Le paramètre 'url' est manquant" }, 400);
 
@@ -66,27 +60,32 @@ Deno.serve(async (req) => {
     return json({ error: "URL invalide", value: targetUrl }, 400);
   }
 
+  // ---- Mode test : quel UA passe ? ----
+  if (isTest) {
+    const results = await testUserAgents(parsedTarget.toString());
+    const winners = results.filter((r) => r.verdict === "OK").map((r) => r.name);
+    return json({
+      url: targetUrl,
+      note: winners.length
+        ? `UA qui renvoient le vrai contenu : ${winners.join(", ")}. Reprends-en un dans UA_LIST pour l'usage normal.`
+        : "Aucun UA n'a renvoyé le vrai contenu depuis cette IP. Si tu es sur un serveur/datacenter, réessaie depuis ta machine locale.",
+      results,
+    });
+  }
+
+  // ---- Usage normal ----
   try {
     const result = await fetchWithFallback(parsedTarget.toString());
 
     if (!result.ok) {
-      return json(
-        {
-          error: result.reason === "challenge"
-            ? "Bloqué par un challenge JavaScript (Cloudflare/anti-bot) — impossible sans rendu JS"
-            : "Aucun user-agent n'a permis de récupérer une page exploitable",
-          hint: result.reason === "challenge"
-            ? (SCRAPE_API
-                ? "Active le rendu JS sur ton service : render_js=true + stealth_proxy (ScrapingBee) ou render=true + ultra_premium=true (ScraperAPI)."
-                : "fetch n'exécute pas de JS. Passe par SCRAPE_API avec rendu JS, un proxy résidentiel, ou FlareSolverr.")
-            : (SCRAPE_API
-                ? "Le service SCRAPE_API a échoué : vérifie clé/quota/paramètres."
-                : "403 = anti-bot. Définis SCRAPE_API (voir en-tête du fichier)."),
-          url: targetUrl,
-          lastAttempt: result.last,
-        },
-        502,
-      );
+      return json({
+        error: result.reason === "challenge"
+          ? "Bloqué par un challenge JavaScript (Cloudflare/anti-bot) — impossible sans rendu JS"
+          : "Aucun user-agent n'a permis de récupérer une page exploitable",
+        hint: "Lance le mode diagnostic avec &test=1 pour voir quel UA passe depuis ton IP.",
+        url: targetUrl,
+        lastAttempt: result.last,
+      }, 502);
     }
 
     const metadata = parseHtml(result.html, targetUrl);
@@ -103,15 +102,48 @@ Deno.serve(async (req) => {
   }
 });
 
-/* -------------------- Fetch avec fallback -------------------- */
+/* -------------------- Mode test -------------------- */
 
-type FetchOk = {
-  ok: true;
-  html: string;
-  userAgent: string;
+type TestResult = {
+  name: string;
   status: number;
-  finalUrl: string;
+  challenge: boolean;
+  hasOgTags: boolean;
+  verdict: "OK" | "CHALLENGE" | "BLOCKED" | "ERROR";
+  error?: string;
 };
+
+async function testUserAgents(url: string): Promise<TestResult[]> {
+  const results = await Promise.all(UA_LIST.map(async ({ name, ua }): Promise<TestResult> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        headers: { ...BASE_HEADERS, "user-agent": ua },
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      const html = await res.text();
+      const challenge = looksChallenged(html);
+      const hasOgTags = /<meta[^>]+property=["']og:/i.test(html);
+      const verdict: TestResult["verdict"] =
+        res.ok && !challenge && hasOgTags ? "OK" : challenge ? "CHALLENGE" : "BLOCKED";
+      return { name, status: res.status, challenge, hasOgTags, verdict };
+    } catch (err) {
+      return { name, status: 0, challenge: false, hasOgTags: false, verdict: "ERROR", error: (err as Error).message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }));
+
+  const rank: Record<TestResult["verdict"], number> = { OK: 0, CHALLENGE: 1, BLOCKED: 2, ERROR: 3 };
+  results.sort((a, b) => rank[a.verdict] - rank[b.verdict]);
+  return results;
+}
+
+/* -------------------- Fetch avec fallback (usage normal) -------------------- */
+
+type FetchOk = { ok: true; html: string; userAgent: string; status: number; finalUrl: string };
 type FetchFail = {
   ok: false;
   reason: "challenge" | "http" | "none";
@@ -123,12 +155,10 @@ function buildRequestUrl(target: string): string {
   return target;
 }
 
-// Détecte les pages-piège anti-bot (challenge JS) plutôt que le vrai contenu.
 function looksChallenged(html: string): boolean {
   const title = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "").toLowerCase();
   if (title.includes("just a moment") || title.includes("attention required")) return true;
-  return /challenges\.cloudflare\.com|cf-browser-verification|__cf_chl|_cf_chl_opt|turnstile|cf-mitigated/i
-    .test(html);
+  return /challenges\.cloudflare\.com|cf-browser-verification|__cf_chl|_cf_chl_opt|turnstile|cf-mitigated/i.test(html);
 }
 
 async function fetchWithFallback(url: string): Promise<FetchOk | FetchFail> {
@@ -136,32 +166,29 @@ async function fetchWithFallback(url: string): Promise<FetchOk | FetchFail> {
   let sawChallenge = false;
   const requestUrl = buildRequestUrl(url);
 
-  for (const agent of AGENTS) {
+  for (const { ua } of UA_LIST) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
       const res = await fetch(requestUrl, {
-        headers: { ...BASE_HEADERS, ...agent.headers, "user-agent": agent.ua },
+        headers: { ...BASE_HEADERS, "user-agent": ua },
         redirect: "follow",
         signal: controller.signal,
       });
-
       const html = await res.text();
       const challenge = looksChallenged(html);
       if (challenge) sawChallenge = true;
-      last = { status: res.status, snippet: html.slice(0, 300), userAgent: agent.ua, challenge };
+      last = { status: res.status, snippet: html.slice(0, 300), userAgent: ua, challenge };
 
-      // Succès seulement si : statut OK, pas de challenge, et des <meta> présents.
       if (res.ok && !challenge && /<meta\b/i.test(html)) {
-        return { ok: true, html, userAgent: agent.ua, status: res.status, finalUrl: res.url };
+        return { ok: true, html, userAgent: ua, status: res.status, finalUrl: res.url };
       }
     } catch (err) {
-      last = { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: agent.ua, challenge: false };
+      last = { status: 0, snippet: `fetch error: ${(err as Error).message}`, userAgent: ua, challenge: false };
     } finally {
       clearTimeout(timer);
     }
-
-    if (SCRAPE_API) break; // le service gère lui-même la rotation
+    if (SCRAPE_API) break;
   }
 
   return { ok: false, reason: sawChallenge ? "challenge" : (last ? "http" : "none"), last };
@@ -194,7 +221,6 @@ function parseHtml(html: string, originalUrl: string) {
       metadata.charset = attrs.charset;
     }
   }
-
   return metadata;
 }
 
@@ -214,19 +240,13 @@ function extractJsonLd(html: string): unknown[] {
   const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html))) {
-    try {
-      blocks.push(JSON.parse(m[1].trim()));
-    } catch {
-      /* JSON-LD malformé : on ignore */
-    }
+    try { blocks.push(JSON.parse(m[1].trim())); } catch { /* ignore */ }
   }
   return blocks;
 }
 
 function decodeEntities(str: string): string {
-  const named: Record<string, string> = {
-    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-  };
+  const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
   return str
     .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
     .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
@@ -238,9 +258,6 @@ function decodeEntities(str: string): string {
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
-    },
+    headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" },
   });
 }
