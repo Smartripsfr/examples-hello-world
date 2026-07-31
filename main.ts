@@ -1,12 +1,6 @@
 // main.ts
 import { DOMParser, type Element } from "https://deno.land/x/deno_dom/deno-dom-wasm.ts";
 
-// Si tu as une clé ScraperAPI/ScrapingBee, mets-la dans les variables
-// d'environnement de ton projet Deno Deploy sous le nom SCRAPER_API_KEY.
-// Sinon laisse vide : le serveur essaiera un fetch direct avec des headers
-// de navigateur réalistes.
-const SCRAPER_API_KEY = Deno.env.get("SCRAPER_API_KEY") ?? "";
-
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
   "Access-Control-Allow-Origin": "*",
@@ -19,66 +13,69 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-// Headers imitant un vrai navigateur Chrome pour limiter les blocages anti-bot.
-function browserHeaders(): HeadersInit {
-  return {
+function browserHeaders(cookie?: string): HeadersInit {
+  const headers: Record<string, string> = {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept":
       "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.google.com/",
     "sec-ch-ua": `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`,
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": `"Windows"`,
     "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
+    "sec-fetch-site": "same-origin",
     "sec-fetch-user": "?1",
     "sec-fetch-dest": "document",
     "Upgrade-Insecure-Requests": "1",
   };
+  if (cookie) headers["Cookie"] = cookie;
+  return headers;
 }
 
-// Récupère le HTML soit directement, soit via un service de scraping tiers
-// (ScraperAPI) si une clé est configurée et que le fetch direct échoue.
-async function fetchHtml(
+// Extrait les paires "nom=valeur" des en-têtes Set-Cookie renvoyés par le serveur.
+function extractCookieHeader(res: Response): string {
+  const setCookie = res.headers.get("set-cookie");
+  if (!setCookie) return "";
+  // Peut contenir plusieurs cookies séparés par une virgule selon l'environnement;
+  // on ne garde que la partie "nom=valeur" de chacun.
+  return setCookie
+    .split(/,(?=[^;]+?=)/)
+    .map((c) => c.split(";")[0].trim())
+    .join("; ");
+}
+
+async function fetchWithWarmup(
   targetUrl: string,
 ): Promise<{ html: string } | { error: string; status?: number }> {
-  // 1. Tentative directe
+  const origin = new URL(targetUrl).origin;
+
   try {
-    const res = await fetch(targetUrl, { headers: browserHeaders() });
+    // Étape 1 : visite de la page d'accueil pour obtenir des cookies de session,
+    // comme le ferait un vrai visiteur avant de naviguer vers une page produit.
+    const warmupRes = await fetch(origin, { headers: browserHeaders() });
+    const cookie = extractCookieHeader(warmupRes);
+
+    // Petite pause pour ne pas enchaîner les requêtes de façon trop robotique.
+    await new Promise((r) => setTimeout(r, 800 + Math.random() * 700));
+
+    // Étape 2 : requête réelle avec les cookies récupérés + un Referer cohérent.
+    const res = await fetch(targetUrl, {
+      headers: {
+        ...browserHeaders(cookie),
+        "Referer": origin + "/",
+      },
+    });
+
     if (res.ok) {
       return { html: await res.text() };
     }
-    // Si ça échoue (ex: 403) et qu'on a une clé de scraping, on tente le fallback.
-    if (SCRAPER_API_KEY) {
-      return await fetchViaScraperApi(targetUrl);
-    }
-    return { error: `Échec de récupération directe (status ${res.status})`, status: res.status };
+    return {
+      error: `Échec de récupération (status ${res.status}). Probable blocage IP au niveau du bot-manager — voir suggestions de migration.`,
+      status: res.status,
+    };
   } catch (err) {
-    if (SCRAPER_API_KEY) {
-      return await fetchViaScraperApi(targetUrl);
-    }
-    return { error: `Erreur réseau lors du fetch direct: ${String(err)}` };
-  }
-}
-
-// Fallback via ScraperAPI (https://www.scraperapi.com/) — gère la rotation
-// d'IP et contourne la plupart des protections anti-bot.
-// Adapte l'URL si tu utilises un autre service (ScrapingBee, Zyte, etc.).
-async function fetchViaScraperApi(
-  targetUrl: string,
-): Promise<{ html: string } | { error: string; status?: number }> {
-  const proxyUrl = `https://api.scraperapi.com/?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(targetUrl)}`;
-  try {
-    const res = await fetch(proxyUrl);
-    if (!res.ok) {
-      return { error: `Échec via ScraperAPI (status ${res.status})`, status: res.status };
-    }
-    return { html: await res.text() };
-  } catch (err) {
-    return { error: `Erreur réseau via ScraperAPI: ${String(err)}` };
+    return { error: `Erreur réseau: ${String(err)}` };
   }
 }
 
@@ -111,7 +108,6 @@ function extractMetaTags(html: string): Record<string, string> | null {
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
 
-  // Pré-vol CORS
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: JSON_HEADERS });
   }
@@ -126,13 +122,10 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!targetUrl.includes("getyourguide.")) {
-    return jsonResponse(
-      { error: "Cette route n'accepte que des liens getyourguide.*" },
-      400,
-    );
+    return jsonResponse({ error: "Cette route n'accepte que des liens getyourguide.*" }, 400);
   }
 
-  const result = await fetchHtml(targetUrl);
+  const result = await fetchWithWarmup(targetUrl);
 
   if ("error" in result) {
     return jsonResponse({ error: result.error }, result.status ?? 502);
